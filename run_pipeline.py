@@ -20,16 +20,25 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# Must run before any project imports — exec(open(...)) does not set sys.path automatically.
+# Must run before any project imports — exec(open(...)) does not set sys.path or __file__.
 _COLAB_PROJECT_DIRS = (
     Path("/content/Siemens-Air"),
     Path("/content/Siemens-air"),
 )
-_PROJECT_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = next(
-    (path for path in _COLAB_PROJECT_DIRS if path.is_dir()),
-    _PROJECT_DIR,
-)
+
+
+def _resolve_project_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        pass
+    for path in _COLAB_PROJECT_DIRS:
+        if path.is_dir():
+            return path
+    return Path.cwd()
+
+
+PROJECT_DIR = _resolve_project_dir()
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
