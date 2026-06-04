@@ -20,7 +20,20 @@ _COLAB_CODE_DIRS = (
     Path("/content/Siemens-Air"),
     Path("/content/Siemens-air"),
 )
-_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_script_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except NameError:
+        pass
+    for path in _COLAB_CODE_DIRS:
+        if path.is_dir():
+            return path
+    return Path.cwd()
+
+
+_SCRIPT_DIR = _resolve_script_dir()
 
 BASE_DIR = next((path for path in _COLAB_CODE_DIRS if path.is_dir()), _SCRIPT_DIR)
 
