@@ -289,6 +289,51 @@ def extract_air_workbook(
     )
 
 
+def extract_air_workbook_rate_card_only(
+    file_path: Path,
+    rate_card_sheet: str,
+) -> ExtractionResult:
+    rate_card_raw = pd.read_excel(
+        file_path,
+        sheet_name=rate_card_sheet,
+        header=None,
+    )
+    rate_card_df, rate_card_header_row = extract_rate_card_df(rate_card_raw)
+    zones_df = pd.DataFrame()
+
+    PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
+    output_file = PROCESSING_DIR / f"{file_path.stem}_extracted.xlsx"
+
+    metadata_df = pd.DataFrame(
+        [
+            {"Field": "Source file", "Value": file_path.name},
+            {"Field": "Rate Card tab", "Value": rate_card_sheet},
+            {"Field": "Zones tab", "Value": "N/A (LATAM mode)"},
+            {"Field": "Rate Card header row (0-based)", "Value": rate_card_header_row},
+            {"Field": "Zones header row (0-based)", "Value": -1},
+            {"Field": "Rate Card rows", "Value": len(rate_card_df)},
+            {"Field": "Zones rows", "Value": 0},
+        ]
+    )
+
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        rate_card_df.to_excel(
+            writer,
+            sheet_name=OUTPUT_SHEET_NAMES["rate_card"],
+            index=False,
+        )
+        metadata_df.to_excel(writer, sheet_name="Metadata", index=False)
+
+    return ExtractionResult(
+        rate_card=rate_card_df,
+        zones=zones_df,
+        source_file=file_path,
+        output_file=output_file,
+        rate_card_header_row=rate_card_header_row,
+        zones_header_row=-1,
+    )
+
+
 def run_interactive_extraction() -> ExtractionResult:
     input_files = list_input_files()
     if not input_files:
