@@ -60,6 +60,7 @@ DGR_FEE_HEADER = "DGR Fee"
 FLAT_TRANSPORT_COLUMN = "Flat"
 ORIGIN_COUNTRY_CODE_COLUMN = "origin country code"
 DESTINATION_COUNTRY_CODE_COLUMN = "destination country code"
+LATAM_COUNTRY_CODES = ("BR", "CL", "CO", "EC", "MX", "PE")
 
 BOLD_SHIPMENT_HEADERS = {
     "Origin Zone",
@@ -405,12 +406,22 @@ def _get_canonical_transport_columns(
     rate_card: pd.DataFrame,
 ) -> list[str]:
     transport_columns = _transport_source_columns(columns)
+    # Keep configured transport brackets even when source cells are empty;
+    # _resolve_transport_column_value() will backfill bracket values from Flat.
+    canonical = [
+        column
+        for column in transport_columns
+        if _column_key(column) != _column_key(FLAT_TRANSPORT_COLUMN)
+    ]
+    if canonical:
+        return canonical
+
+    # Fallback for unusual layouts with only Flat or sparse columns.
     non_drop_rows = rate_card[~rate_card.apply(_is_drop_shipment_row, axis=1)]
     return [
         column
         for column in transport_columns
-        if _column_key(column) != _column_key(FLAT_TRANSPORT_COLUMN)
-        and _column_has_data_in_rows(column, non_drop_rows)
+        if _column_has_data_in_rows(column, non_drop_rows)
     ]
 
 
@@ -570,6 +581,53 @@ def _build_ratio_cost_blocks(
     return blocks
 
 
+def _build_unified_cost_blocks(
+    columns: pd.Index,
+    rate_card: pd.DataFrame,
+) -> list[MatrixCostBlock]:
+    blocks: list[MatrixCostBlock] = []
+    canonical_transport_columns = _get_canonical_transport_columns(columns, rate_card)
+    transport_block = _build_transport_cost_block(
+        "Transport cost",
+        canonical_transport_columns,
+        ratio_value=None,
+        drop_shipment_only=False,
+    )
+    if transport_block is not None:
+        blocks.append(transport_block)
+
+    if FIX_FUEL_SURCHARGE_COLUMN in rate_card.columns:
+        blocks.append(
+            MatrixCostBlock(
+                cost_name=FUEL_SURCHARGE_COST_NAME,
+                currency_column="Currency",
+                columns=[
+                    _build_matrix_cost_column(
+                        FUEL_SURCHARGE_COST_NAME,
+                        FIX_FUEL_SURCHARGE_COLUMN,
+                        rate_unit="p/unit",
+                    )
+                ],
+            )
+        )
+
+    if SECURITY_SURCH_OUTLAY_COLUMN in rate_card.columns:
+        blocks.append(
+            MatrixCostBlock(
+                cost_name=SECURITY_SURCHARGE_COST_NAME,
+                currency_column="Currency",
+                columns=[
+                    _build_matrix_cost_column(
+                        SECURITY_SURCHARGE_COST_NAME,
+                        SECURITY_SURCH_OUTLAY_COLUMN,
+                        rate_unit="p/unit",
+                    )
+                ],
+            )
+        )
+    return blocks
+
+
 def _is_ratio_handled_column(column: str) -> bool:
     name = _normalize_label(column)
     if is_transport_cost_column(name):
@@ -609,8 +667,15 @@ def _build_standalone_cost_blocks(
 def _build_cost_blocks(
     columns: pd.Index,
     rate_card: pd.DataFrame,
+    *,
+    ignore_volume_weight_ratio: bool = False,
 ) -> list[MatrixCostBlock]:
-    return _build_ratio_cost_blocks(columns, rate_card) + _build_standalone_cost_blocks(
+    ratio_or_unified_blocks = (
+        _build_unified_cost_blocks(columns, rate_card)
+        if ignore_volume_weight_ratio
+        else _build_ratio_cost_blocks(columns, rate_card)
+    )
+    return ratio_or_unified_blocks + _build_standalone_cost_blocks(
         columns,
         rate_card,
     )
@@ -642,6 +707,17 @@ def _sanitize_cost_value(value: object, *, allow_string: bool = False) -> object
     if numeric == int(numeric):
         return int(numeric)
     return float(numeric)
+
+
+def _is_zero_like(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return float(value) == 0.0
+    numeric = pd.to_numeric(str(value).strip().replace(",", "."), errors="coerce")
+    return not pd.isna(numeric) and float(numeric) == 0.0
 
 
 def _extract_numeric_token(text: str) -> int | float | None:
@@ -751,6 +827,49 @@ def _filter_empty_cost_blocks(
     rate_card: pd.DataFrame,
 ) -> list[MatrixCostBlock]:
     return [block for block in blocks if _cost_block_has_data(block, rate_card)]
+
+
+def _column_has_meaningful_cost_data(
+    rate_card: pd.DataFrame,
+    block: MatrixCostBlock,
+    column: MatrixCostColumn,
+) -> bool:
+    for _, row in rate_card.iterrows():
+        value = _value_for_block(row, block, column)
+        if _is_empty_value(value) or _is_zero_like(value):
+            continue
+        return True
+    return False
+
+
+def _drop_empty_or_zero_cost_columns(
+    blocks: list[MatrixCostBlock],
+    rate_card: pd.DataFrame,
+) -> list[MatrixCostBlock]:
+    pruned: list[MatrixCostBlock] = []
+    for block in blocks:
+        if _is_dgr_fee_block(block):
+            if _cost_block_has_data(block, rate_card):
+                pruned.append(block)
+            continue
+
+        kept_columns = [
+            column
+            for column in block.columns
+            if _column_has_meaningful_cost_data(rate_card, block, column)
+        ]
+        if not kept_columns:
+            continue
+        pruned.append(
+            MatrixCostBlock(
+                cost_name=block.cost_name,
+                currency_column=block.currency_column,
+                columns=kept_columns,
+                volume_weight_ratio=block.volume_weight_ratio,
+                drop_shipment_only=block.drop_shipment_only,
+            )
+        )
+    return pruned
 
 
 def _expand_block_columns(block: MatrixCostBlock) -> list[MatrixCostColumn]:
@@ -955,10 +1074,19 @@ def _apply_worksheet_formatting(
 def build_rate_card_matrix(
     rate_card: pd.DataFrame,
     output_path: Path,
+    *,
+    drop_empty_or_zero_cost_columns: bool = False,
+    ignore_volume_weight_ratio: bool = False,
 ) -> MatrixBuildResult:
     shipment_columns = _build_shipment_columns(rate_card.columns, rate_card)
-    cost_blocks = _build_cost_blocks(rate_card.columns, rate_card)
+    cost_blocks = _build_cost_blocks(
+        rate_card.columns,
+        rate_card,
+        ignore_volume_weight_ratio=ignore_volume_weight_ratio,
+    )
     cost_blocks = _filter_empty_cost_blocks(cost_blocks, rate_card)
+    if drop_empty_or_zero_cost_columns:
+        cost_blocks = _drop_empty_or_zero_cost_columns(cost_blocks, rate_card)
     matrix_rows, cost_columns = _build_matrix_rows(
         rate_card,
         shipment_columns,
@@ -1030,13 +1158,19 @@ def apply_lane_country_filters(
     rate_card: pd.DataFrame,
     *,
     de_only: bool = False,
-    br_only: bool = False,
+    latam_only: bool = False,
 ) -> pd.DataFrame:
     filtered = rate_card
     if de_only:
         filtered = filter_lanes_ex_to_country(filtered, "DE")
-    if br_only:
-        filtered = filter_lanes_ex_to_country(filtered, "BR")
+    if latam_only:
+        latam_codes = set(LATAM_COUNTRY_CODES)
+        origin_codes = filtered[ORIGIN_COUNTRY_CODE_COLUMN].map(_normalize_country_code)
+        destination_codes = filtered[DESTINATION_COUNTRY_CODE_COLUMN].map(
+            _normalize_country_code
+        )
+        keep_mask = origin_codes.isin(latam_codes) | destination_codes.isin(latam_codes)
+        filtered = filtered[keep_mask].reset_index(drop=True)
     return filtered
 
 
@@ -1050,12 +1184,13 @@ def prompt_yes_no(question: str) -> bool:
         print("Please answer yes or no.")
 
 
-def prompt_lane_country_filters() -> tuple[bool, bool]:
+def prompt_lane_country_filters() -> tuple[bool, bool, bool]:
     de_only = prompt_yes_no("Use lanes ex/to DE ONLY?")
     if de_only:
-        return True, False
-    br_only = prompt_yes_no("Use lanes ex/to BR ONLY?")
-    return False, br_only
+        return True, False, True
+    latam_only = prompt_yes_no("Use lanes ex/to LATAM ONLY?")
+    drop_empty_or_zero_cost_columns = True
+    return False, latam_only, drop_empty_or_zero_cost_columns
 
 
 def build_matrix_from_rate_card(
@@ -1063,32 +1198,44 @@ def build_matrix_from_rate_card(
     output_file: Path,
     *,
     de_only: bool = False,
-    br_only: bool = False,
+    latam_only: bool = False,
+    drop_empty_or_zero_cost_columns: bool = False,
+    ignore_volume_weight_ratio: bool = False,
 ) -> MatrixBuildResult:
     original_row_count = len(rate_card)
     filtered_rate_card = apply_lane_country_filters(
         rate_card,
         de_only=de_only,
-        br_only=br_only,
+        latam_only=latam_only,
     )
     if len(filtered_rate_card) == 0:
         filters = []
         if de_only:
             filters.append("DE")
-        if br_only:
-            filters.append("BR")
+        if latam_only:
+            filters.append(f"LATAM ({', '.join(LATAM_COUNTRY_CODES)})")
         filter_text = " and ".join(filters) if filters else "selected"
         raise ValueError(
             f"No lanes remain after applying {filter_text} country filter(s)."
         )
 
-    result = build_rate_card_matrix(filtered_rate_card, output_file)
-    if de_only or br_only:
+    result = build_rate_card_matrix(
+        filtered_rate_card,
+        output_file,
+        drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
+        ignore_volume_weight_ratio=ignore_volume_weight_ratio,
+    )
+    if de_only or latam_only:
         print(f"Filtered lanes: {original_row_count} -> {len(filtered_rate_card)} rows")
         if de_only:
             print("  Applied filter: ex/to DE ONLY")
-        if br_only:
-            print("  Applied filter: ex/to BR ONLY")
+        if latam_only:
+            print(
+                "  Applied filter: ex/to LATAM ONLY "
+                f"({', '.join(LATAM_COUNTRY_CODES)})"
+            )
+    if drop_empty_or_zero_cost_columns:
+        print("  Applied filter: drop empty/zero cost columns")
     return result
 
 
@@ -1097,34 +1244,46 @@ def build_matrix_from_processing_file(
     output_file: Path | None = None,
     *,
     de_only: bool = False,
-    br_only: bool = False,
+    latam_only: bool = False,
+    drop_empty_or_zero_cost_columns: bool = False,
+    ignore_volume_weight_ratio: bool = False,
 ) -> MatrixBuildResult:
     rate_card = load_extracted_rate_card(processing_file)
     original_row_count = len(rate_card)
     rate_card = apply_lane_country_filters(
         rate_card,
         de_only=de_only,
-        br_only=br_only,
+        latam_only=latam_only,
     )
     if len(rate_card) == 0:
         filters = []
         if de_only:
             filters.append("DE")
-        if br_only:
-            filters.append("BR")
+        if latam_only:
+            filters.append(f"LATAM ({', '.join(LATAM_COUNTRY_CODES)})")
         filter_text = " and ".join(filters) if filters else "selected"
         raise ValueError(
             f"No lanes remain after applying {filter_text} country filter(s)."
         )
     if output_file is None:
         output_file = OUTPUT_DIR / f"{processing_file.stem.replace('_extracted', '')}_matrix.xlsx"
-    result = build_rate_card_matrix(rate_card, output_file)
-    if de_only or br_only:
+    result = build_rate_card_matrix(
+        rate_card,
+        output_file,
+        drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
+        ignore_volume_weight_ratio=ignore_volume_weight_ratio,
+    )
+    if de_only or latam_only:
         print(f"Filtered lanes: {original_row_count} -> {len(rate_card)} rows")
         if de_only:
             print("  Applied filter: ex/to DE ONLY")
-        if br_only:
-            print("  Applied filter: ex/to BR ONLY")
+        if latam_only:
+            print(
+                "  Applied filter: ex/to LATAM ONLY "
+                f"({', '.join(LATAM_COUNTRY_CODES)})"
+            )
+    if drop_empty_or_zero_cost_columns:
+        print("  Applied filter: drop empty/zero cost columns")
     return result
 
 
@@ -1152,11 +1311,12 @@ def run_interactive_matrix_build() -> MatrixBuildResult:
                 break
         print("Invalid choice. Try again.")
 
-    de_only, br_only = prompt_lane_country_filters()
+    de_only, latam_only, drop_empty_or_zero_cost_columns = prompt_lane_country_filters()
     result = build_matrix_from_processing_file(
         selected_file,
         de_only=de_only,
-        br_only=br_only,
+        latam_only=latam_only,
+        drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
     )
     print(f"\nSaved matrix rate card to: {result.matrix_path}")
     print(f"Data rows: {result.row_count}")
