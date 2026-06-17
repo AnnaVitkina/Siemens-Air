@@ -107,13 +107,31 @@ def prompt_siemens_business_scope() -> Literal["all_di", "all_di_shs", "both"]:
     return "all_di"
 
 
+def prompt_use_zones_for_standard_shipper() -> bool:
+    return prompt_choice(
+        "Use Zones tab for Siemens Healthineers/Divisions processing?",
+        ["Yes", "No"],
+        default="Yes",
+    ) == "Yes"
+
+
 def filter_rate_card_by_siemens_business(
     rate_card: pd.DataFrame,
     allowed_values: set[str],
 ) -> pd.DataFrame:
-    column_name = "siemens division"
-    if column_name not in rate_card.columns:
-        raise ValueError(f"Missing column: {column_name}")
+    preferred_columns = [
+        "siemens division",   # Siemens_Business after extractor normalization
+        "Siemens_Business",   # raw style
+        "siemens_business",   # raw style lower
+        "business unit code", # siemens_division after extractor normalization
+        "siemens_division",   # raw style
+    ]
+    column_name = next((name for name in preferred_columns if name in rate_card.columns), None)
+    if column_name is None:
+        raise ValueError(
+            "Missing Siemens business column. "
+            f"Tried: {', '.join(preferred_columns)}"
+        )
 
     normalized = (
         rate_card[column_name]
@@ -123,8 +141,38 @@ def filter_rate_card_by_siemens_business(
         .str.upper()
         .replace({"ALL": "ALL"})
     )
-    keep_mask = normalized.isin({value.upper() for value in allowed_values})
+    allowed = {value.upper() for value in allowed_values}
+    use_contains_logic = column_name in {"business unit code", "siemens_division"}
+
+    def _value_in_scope(value: str) -> bool:
+        if value == "":
+            return "" in allowed
+        if use_contains_logic:
+            if "ALL" in allowed and "ALL" in value:
+                return True
+            if "DI" in allowed and "DI" in value:
+                return True
+            if "SHS" in allowed and "SHS" in value:
+                return True
+            return value in allowed
+        if "ALL" in allowed and value == "ALL":
+            return True
+        if "DI" in allowed and (value == "DI" or value.startswith("DI ") or value.startswith("DI_")):
+            return True
+        if "SHS" in allowed and (
+            value == "SHS" or value.startswith("SHS ") or value.startswith("SHS_")
+        ):
+            return True
+        return value in allowed
+
+    keep_mask = normalized.map(_value_in_scope)
     return rate_card[keep_mask].reset_index(drop=True)
+
+
+def get_default_rate_card_sheet(file_path: Path, shipper_mode: Literal["standard", "latam"]) -> str:
+    if shipper_mode == "latam":
+        return LATAM_RATE_CARD_DEFAULT_SHEET
+    return DEFAULT_SHEETS["rate_card"]
 
 
 def run_interactive_pipeline() -> PipelineResult:
@@ -156,28 +204,38 @@ def run_interactive_pipeline() -> PipelineResult:
 
     print(f"\n--- Sheet selection for: {file_path.name} ---")
     sheet_names = list_workbook_sheets(file_path)
+    default_rate_card_sheet = get_default_rate_card_sheet(file_path, shipper_mode)
+    use_zones = True
     if shipper_mode == "latam":
         rate_card_tab = prompt_sheet_name(
             sheet_names,
             "Rate Card (look for tab containing: rate card)",
-            LATAM_RATE_CARD_DEFAULT_SHEET,
+            default_rate_card_sheet,
         )
     else:
-        sheet_mapping = {
-            "rate_card": prompt_sheet_name(
+        use_zones = prompt_use_zones_for_standard_shipper()
+        if use_zones:
+            sheet_mapping = {
+                "rate_card": prompt_sheet_name(
+                    sheet_names,
+                    "Rate Card (look for tab containing: air rate card)",
+                    default_rate_card_sheet,
+                ),
+                "zones": prompt_sheet_name(
+                    sheet_names,
+                    "Zones (look for tab containing: Airport zones GAT)",
+                    DEFAULT_SHEETS["zones"],
+                ),
+            }
+        else:
+            rate_card_tab = prompt_sheet_name(
                 sheet_names,
                 "Rate Card (look for tab containing: air rate card)",
-                DEFAULT_SHEETS["rate_card"],
-            ),
-            "zones": prompt_sheet_name(
-                sheet_names,
-                "Zones (look for tab containing: Airport zones GAT)",
-                DEFAULT_SHEETS["zones"],
-            ),
-        }
+                default_rate_card_sheet,
+            )
 
     print("\n--- Step 1/3: Extracting source workbook ---")
-    if shipper_mode == "latam":
+    if shipper_mode == "latam" or (shipper_mode == "standard" and not use_zones):
         extraction = extract_air_workbook_rate_card_only(file_path, rate_card_tab)
     else:
         extraction = extract_air_workbook(file_path, sheet_mapping)
@@ -185,6 +243,8 @@ def run_interactive_pipeline() -> PipelineResult:
     print(f"  Rate Card rows: {len(extraction.rate_card)}")
     if shipper_mode == "latam":
         print("  Zones rows: 0 (LATAM mode)")
+    elif not use_zones:
+        print("  Zones rows: 0 (Zones ignored by choice)")
     else:
         print(f"  Zones rows: {len(extraction.zones)}")
 
@@ -207,7 +267,7 @@ def run_interactive_pipeline() -> PipelineResult:
         )
 
     if shipper_mode == "standard" and business_scope != "both":
-        allowed = {"ALL", "DI"} if business_scope == "all_di" else {"ALL", "DI", "SHS"}
+        allowed = {"ALL", "DI", ""} if business_scope == "all_di" else {"ALL", "DI", "SHS", ""}
         before_business_count = len(prefiltered_rate_card)
         prefiltered_rate_card = filter_rate_card_by_siemens_business(
             prefiltered_rate_card,
@@ -230,45 +290,60 @@ def run_interactive_pipeline() -> PipelineResult:
 
     if shipper_mode == "latam":
         print("\n--- Step 2/3: Skipping zones export (LATAM mode) ---")
+    elif not use_zones:
+        print("\n--- Step 2/3: Skipping zones export (Zones ignored by choice) ---")
+        if business_scope == "both":
+            rate_card_all_di = filter_rate_card_by_siemens_business(rate_card, {"ALL", "DI", ""})
+            rate_card_all_di_shs = filter_rate_card_by_siemens_business(
+                rate_card, {"ALL", "DI", "SHS", ""}
+            )
+            if len(rate_card_all_di) == 0:
+                print("  Scope ALL_DI has no lanes after filtering (tab will be skipped).")
+            if len(rate_card_all_di_shs) == 0:
+                print("  Scope ALL_DI_SHS has no lanes after filtering (tab will be skipped).")
     elif business_scope == "both":
         print(
             "\n--- Step 2/3: Applying exclusions per Siemens_Business scope "
             "(independent for each tab) ---"
         )
-        rate_card_all_di_input = filter_rate_card_by_siemens_business(rate_card, {"ALL", "DI"})
+        rate_card_all_di_input = filter_rate_card_by_siemens_business(rate_card, {"ALL", "DI", ""})
         rate_card_all_di_shs_input = filter_rate_card_by_siemens_business(
-            rate_card, {"ALL", "DI", "SHS"}
+            rate_card, {"ALL", "DI", "SHS", ""}
         )
-        if len(rate_card_all_di_input) == 0:
-            raise ValueError("No lanes remain for scope ALL and DI.")
-        if len(rate_card_all_di_shs_input) == 0:
-            raise ValueError("No lanes remain for scope ALL, DI, and SHS.")
 
         zones_all_di_output = OUTPUT_DIR / f"{output_stem}_ALL_DI_zones.txt"
         zones_all_di_shs_output = OUTPUT_DIR / f"{output_stem}_ALL_DI_SHS_zones.txt"
 
-        zones_all_di, rate_card_all_di = export_zones_from_rate_card(
-            rate_card_all_di_input,
-            extraction.zones,
-            zones_all_di_output,
-        )
-        zones_all_di_shs, rate_card_all_di_shs = export_zones_from_rate_card(
-            rate_card_all_di_shs_input,
-            extraction.zones,
-            zones_all_di_shs_output,
-        )
-        zones = zones_all_di
+        if len(rate_card_all_di_input) > 0:
+            zones_all_di, rate_card_all_di = export_zones_from_rate_card(
+                rate_card_all_di_input,
+                extraction.zones,
+                zones_all_di_output,
+            )
+            zones = zones_all_di
+            print(f"Saved zones file (ALL_DI): {zones_all_di.output_path}")
+            print(
+                "  ALL_DI replacements: "
+                f"{zones_all_di.lane_replacement_count} | rows: {len(rate_card_all_di)}"
+            )
+        else:
+            print("  Scope ALL_DI has no lanes after filtering (tab will be skipped).")
 
-        print(f"Saved zones file (ALL_DI): {zones_all_di.output_path}")
-        print(
-            "  ALL_DI replacements: "
-            f"{zones_all_di.lane_replacement_count} | rows: {len(rate_card_all_di)}"
-        )
-        print(f"Saved zones file (ALL_DI_SHS): {zones_all_di_shs.output_path}")
-        print(
-            "  ALL_DI_SHS replacements: "
-            f"{zones_all_di_shs.lane_replacement_count} | rows: {len(rate_card_all_di_shs)}"
-        )
+        if len(rate_card_all_di_shs_input) > 0:
+            zones_all_di_shs, rate_card_all_di_shs = export_zones_from_rate_card(
+                rate_card_all_di_shs_input,
+                extraction.zones,
+                zones_all_di_shs_output,
+            )
+            if zones is None:
+                zones = zones_all_di_shs
+            print(f"Saved zones file (ALL_DI_SHS): {zones_all_di_shs.output_path}")
+            print(
+                "  ALL_DI_SHS replacements: "
+                f"{zones_all_di_shs.lane_replacement_count} | rows: {len(rate_card_all_di_shs)}"
+            )
+        else:
+            print("  Scope ALL_DI_SHS has no lanes after filtering (tab will be skipped).")
     else:
         print("\n--- Step 2/3: Applying ALL-country exclusions and exporting zones ---")
         zones, rate_card = export_zones_from_rate_card(
@@ -287,39 +362,53 @@ def run_interactive_pipeline() -> PipelineResult:
 
     print("\n--- Step 3/3: Building matrix rate card ---")
     if shipper_mode == "standard" and business_scope == "both":
-        if rate_card_all_di is None or rate_card_all_di_shs is None:
-            raise ValueError("Internal error: missing scoped rate cards for both-tab build.")
-        matrix = build_matrix_from_rate_card(
-            rate_card_all_di,
-            matrix_output,
-            de_only=False,
-            latam_only=False,
-            drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
-            ignore_volume_weight_ratio=False,
-            include_dgr_fee_shipment_column=True,
-            sheet_name="ALL_DI",
-            append_sheet_if_exists=False,
-        )
-        matrix_all_di_shs = build_matrix_from_rate_card(
-            rate_card_all_di_shs,
-            matrix_output,
-            de_only=False,
-            latam_only=False,
-            drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
-            ignore_volume_weight_ratio=False,
-            include_dgr_fee_shipment_column=True,
-            sheet_name="ALL_DI_SHS",
-            append_sheet_if_exists=True,
-        )
+        if rate_card_all_di is None and rate_card_all_di_shs is None:
+            raise ValueError("No lanes remain for both scopes ALL_DI and ALL_DI_SHS.")
+
+        matrix: MatrixBuildResult | None = None
+        appended = False
+        if rate_card_all_di is not None and len(rate_card_all_di) > 0:
+            matrix_all_di = build_matrix_from_rate_card(
+                rate_card_all_di,
+                matrix_output,
+                de_only=False,
+                latam_only=False,
+                drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
+                ignore_volume_weight_ratio=False,
+                include_dgr_fee_shipment_column=True,
+                sheet_name="ALL_DI",
+                append_sheet_if_exists=appended,
+            )
+            matrix = matrix_all_di
+            appended = True
+            print(
+                f"  Tab ALL_DI rows after filters: {matrix_all_di.row_count} | "
+                f"Cost blocks: {matrix_all_di.cost_block_count}"
+            )
+
+        if rate_card_all_di_shs is not None and len(rate_card_all_di_shs) > 0:
+            matrix_all_di_shs = build_matrix_from_rate_card(
+                rate_card_all_di_shs,
+                matrix_output,
+                de_only=False,
+                latam_only=False,
+                drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
+                ignore_volume_weight_ratio=False,
+                include_dgr_fee_shipment_column=True,
+                sheet_name="ALL_DI_SHS",
+                append_sheet_if_exists=appended,
+            )
+            if matrix is None:
+                matrix = matrix_all_di_shs
+            appended = True
+            print(
+                f"  Tab ALL_DI_SHS rows after filters: {matrix_all_di_shs.row_count} | "
+                f"Cost blocks: {matrix_all_di_shs.cost_block_count}"
+            )
+
+        if matrix is None:
+            raise ValueError("No lanes remain for both scopes ALL_DI and ALL_DI_SHS.")
         print(f"Saved matrix workbook: {matrix.matrix_path}")
-        print(
-            f"  Tab ALL_DI rows after filters: {matrix.row_count} | "
-            f"Cost blocks: {matrix.cost_block_count}"
-        )
-        print(
-            f"  Tab ALL_DI_SHS rows after filters: {matrix_all_di_shs.row_count} | "
-            f"Cost blocks: {matrix_all_di_shs.cost_block_count}"
-        )
         print(f"  Shipment columns: {matrix.shipment_column_count}")
     else:
         matrix = build_matrix_from_rate_card(
@@ -341,9 +430,19 @@ def run_interactive_pipeline() -> PipelineResult:
     print(f"Extracted workbook: {extraction.output_file}")
     print(f"Matrix workbook:    {matrix.matrix_path}")
     if shipper_mode == "standard" and business_scope == "both":
-        print(f"Zones file:         {output_stem}_ALL_DI_zones.txt and {output_stem}_ALL_DI_SHS_zones.txt")
+        zones_files: list[str] = []
+        if rate_card_all_di is not None and len(rate_card_all_di) > 0:
+            zones_files.append(f"{output_stem}_ALL_DI_zones.txt")
+        if rate_card_all_di_shs is not None and len(rate_card_all_di_shs) > 0:
+            zones_files.append(f"{output_stem}_ALL_DI_SHS_zones.txt")
+        if zones_files:
+            print(f"Zones file:         {' and '.join(zones_files)}")
+        else:
+            print("Zones file:         skipped (no lanes in both scopes)")
     elif zones is not None:
         print(f"Zones file:         {zones.output_path}")
+    elif shipper_mode == "standard" and not use_zones:
+        print("Zones file:         skipped (ignored by choice)")
     else:
         print("Zones file:         skipped (LATAM mode)")
 
