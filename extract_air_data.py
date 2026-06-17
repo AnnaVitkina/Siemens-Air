@@ -7,6 +7,7 @@ to the processing folder with Rate Card and Zones tabs.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,14 +29,90 @@ RATE_CARD_HEADER_MARKERS = (
     "country_contract_owner",
     "origin_country",
     "forwarder_name",
+    "contract owner",
+    "origin country",
+    "forwarder",
 )
 
 RATE_CARD_COLUMN_RENAMES = {
     "origin_airport_code": "Origin Zone",
     "destination_airport_code": "Destination Zone",
+    "origin airport code": "Origin Zone",
+    "destination airport code": "Destination Zone",
+    "origin airport code zone": "Origin Zone",
+    "destination airport code zone": "Destination Zone",
     "siemens_division": "business unit code",
     "siemens_business": "siemens division",
     "siemens_buisness": "siemens division",
+    "airline surcharge per kg": "fix fuel surcharge",
+    "applicable for": "appli for DGR or Special",
+    "volume weight ratio": "volume weight ratio",
+    "volume weight ratio e g 0 0 0 1 6 6 1 7 7 1 8 8": "volume weight ratio",
+    "siemens division in case of special agreement": "siemens division",
+    "service codes": "service code extended",
+    "2000 01 01 00 00 00": "ValidFrom",
+    "2000 12 31 00 00 00": "ValidUntil",
+    "1999 12 12 00 00 00": "date of update",
+}
+
+# Hardcoded mapping for dual-header templates:
+# first-row business labels -> second-row technical labels.
+RATE_CARD_UPPER_TO_LOWER_HEADER_RENAMES = {
+    "country of contract owner iso code": "country_contract_owner",
+    "published scm pi lo internal": "published_P_PC_LO_int",
+    "forwarder name": "forwarder_name",
+    "forwarder short code": "forwarder_short_code",
+    "origin country": "origin_country",
+    "origin country iso code": "origin_country_code",
+    "origin city": "origin_city",
+    "origin airport code zone": "origin_airport_code",
+    "destination country": "destination_country",
+    "destination country iso code": "destination_country_code",
+    "destination city": "destination_city",
+    "destination airport code zone": "destination_airport_code",
+    "service level": "service_level",
+    "service code": "service_code",
+    "special service category e g dgr sp airline service odc uld cool": "appli_for_DGR_or_Special",
+    "transit time in hours": "transit_time_in_hours",
+    "remarks": "Remarks",
+    "currency": "Currency",
+    "minimum": "Minimum",
+    "flat": "Flat",
+    "45 kg": "C_45_kg",
+    "100 kg": "C_100_kg",
+    "300 kg": "C_300_kg",
+    "500 kg": "C_500_kg",
+    "1000 kg": "C_1000_kg",
+    "3000 kg": "C_3000_kg",
+    "99999 kg": "C_99999_kg",
+    "fix fuel surcharge sfi rules in general req": "fix_fuel_surcharge",
+    "fuel surcharge as per outlay": "fuel_surcharge_outlay",
+    "fix security surcharge sfi rules in general req": "fix_security_surcharge",
+    "security surcharge as per outlay": "security_surch_outlay",
+    "dgr fee yes as per outlay amount fix": "DGR_fee",
+    "rate applicable for main deck dims details adjacent": "Airdeck",
+    "maximum lenght x": "max_length_cm",
+    "dimensions width x": "max_width_cm",
+    "in cm height": "max_height_cm",
+    "airline": "airline",
+    "frequency": "frequency",
+    "volume weight ratio e g 0 0 0 1 6 6 1 7 7 1 8 8": "volume_weight_ratio",
+    "currency outbound": "Currency_Outbound",
+    "flat opc outbound processing charge": "Flat_OPC",
+    "currency inbound": "Currency_Inbound",
+    "flat ipc inbound processing charge": "Flat_IPC",
+    "origin airport zone cluster": "origin_apt_zone_cluster",
+    "dest airport zone cluster": "dest_apt_zone_cluster",
+    "ratescope": "Rate_scope",
+    "status": "Status",
+    "id": "ID",
+    "version": "Version",
+    "siemens business in case of special agreement": "Siemens_Business",
+    "business unit code in case of special agreement": "siemens_division",
+    "siemens division (in case of special agreement)": "siemens_division",
+    "responsible person of siemens email address": "responsible_person",
+    "additional information s": "additional_information",
+    "service code extended": "service_code_extended",
 }
 
 
@@ -131,20 +208,37 @@ def prompt_sheet_name(
 
 
 def _row_contains_marker(row: pd.Series, markers: tuple[str, ...]) -> bool:
+    normalized_markers = {_normalize_header_key(marker) for marker in markers}
     for value in row:
         if pd.isna(value):
             continue
-        text = str(value).strip().lower()
-        if any(marker in text for marker in markers):
+        text = _normalize_header_key(str(value))
+        text_tokens = set(text.split())
+        if any(
+            marker in text
+            or set(marker.split()).issubset(text_tokens)
+            for marker in normalized_markers
+        ):
             return True
     return False
+
+
+def _normalize_header_key(text: str) -> str:
+    normalized = str(text).strip().lower()
+    normalized = normalized.replace("\n", " ").replace("_", " ").replace("/", " ")
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def rename_rate_card_columns(columns: pd.Index | list[str]) -> list[str]:
     renamed: list[str] = []
     for column in columns:
         name = str(column).strip()
-        mapped = RATE_CARD_COLUMN_RENAMES.get(name.lower())
+        upper_alias = RATE_CARD_UPPER_TO_LOWER_HEADER_RENAMES.get(_normalize_header_key(name))
+        if upper_alias is not None:
+            name = upper_alias
+        mapped = RATE_CARD_COLUMN_RENAMES.get(_normalize_header_key(name))
         if mapped is not None:
             renamed.append(mapped)
         else:
