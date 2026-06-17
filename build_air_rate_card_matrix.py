@@ -60,6 +60,7 @@ SECURITY_SURCHARGE_COST_NAME = "Security Surcharge"
 DGR_FEE_COLUMN = "DGR fee"
 DGR_FEE_HEADER = "DGR Fee"
 DGR_FEE_SHIPMENT_HEADER = 'DGR fee "yes" = as per outlay amount = fix'
+FLAT_IPC_COLUMN = "Flat IPC"
 FLAT_TRANSPORT_COLUMN = "Flat"
 ORIGIN_COUNTRY_CODE_COLUMN = "origin country code"
 DESTINATION_COUNTRY_CODE_COLUMN = "destination country code"
@@ -687,6 +688,9 @@ def _build_standalone_cost_blocks(
         if _is_dgr_fee_column(name):
             blocks.append(_build_dgr_fee_cost_block())
             continue
+        if _is_flat_ipc_column(name):
+            blocks.append(_build_flat_ipc_cost_block())
+            continue
 
         blocks.append(
             MatrixCostBlock(
@@ -807,6 +811,10 @@ def _is_dgr_fee_column(column: str) -> bool:
     return _column_key(column) == _column_key(DGR_FEE_COLUMN)
 
 
+def _is_flat_ipc_column(column: str) -> bool:
+    return _column_key(column) == _column_key(FLAT_IPC_COLUMN)
+
+
 def _is_dgr_fee_block(block: MatrixCostBlock) -> bool:
     return block.cost_name == DGR_FEE_HEADER
 
@@ -843,6 +851,77 @@ def _build_dgr_fee_cost_block() -> MatrixCostBlock:
                 bracket_label="",
                 rate_unit="p/unit",
                 parse_value=_parse_dgr_fee_secondary,
+            ),
+        ],
+    )
+
+
+def _parse_flat_ipc_parts(value: object) -> tuple[object, object]:
+    if _is_empty_value(value):
+        return None, None
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if numeric == int(numeric):
+            return int(numeric), None
+        return numeric, None
+
+    text = str(value).strip()
+    if not text:
+        return None, None
+
+    per_unit_value: int | float | None = None
+    max_flat_value: int | float | None = None
+
+    per_kg_match = re.search(r"(\d+(?:[.,]\d+)?)\s*per\s*kg", text, flags=re.IGNORECASE)
+    if per_kg_match:
+        per_unit_value = _extract_numeric_token(per_kg_match.group(1))
+
+    max_match = re.search(
+        r"maximum(?:\s+of)?\s+(?:EUR|USD|GBP|CHF|\$|€)?\s*(\d+(?:[.,]\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if max_match:
+        max_flat_value = _extract_numeric_token(max_match.group(1))
+
+    if per_unit_value is None and max_flat_value is None:
+        # Default IPC values should populate p/unit when no explicit maximum pattern exists.
+        per_unit_value = _extract_numeric_token(text)
+    elif per_unit_value is None and max_flat_value is not None:
+        # If only a maximum pattern is present, keep it as MAX Flat.
+        pass
+
+    return per_unit_value, max_flat_value
+
+
+def _parse_flat_ipc_per_unit(value: object) -> object:
+    return _parse_flat_ipc_parts(value)[0]
+
+
+def _parse_flat_ipc_max_flat(value: object) -> object:
+    return _parse_flat_ipc_parts(value)[1]
+
+
+def _build_flat_ipc_cost_block() -> MatrixCostBlock:
+    return MatrixCostBlock(
+        cost_name=FLAT_IPC_COLUMN,
+        currency_column="Currency Inbound",
+        columns=[
+            MatrixCostColumn(
+                cost_name=FLAT_IPC_COLUMN,
+                source_column=FLAT_IPC_COLUMN,
+                bracket_label="",
+                rate_unit="p/unit",
+                parse_value=_parse_flat_ipc_per_unit,
+            ),
+            MatrixCostColumn(
+                cost_name=FLAT_IPC_COLUMN,
+                source_column=FLAT_IPC_COLUMN,
+                bracket_label="",
+                rate_unit="Flat",
+                header_label="MAX Flat",
+                parse_value=_parse_flat_ipc_max_flat,
             ),
         ],
     )
