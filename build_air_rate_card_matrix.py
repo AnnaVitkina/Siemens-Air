@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pandas as pd
 from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -51,12 +52,14 @@ VOLUME_WEIGHT_RATIO_COLUMN = "volume weight ratio"
 REMARKS_COLUMN = "Remarks"
 DROP_SHIPMENT_REMARK_MARKER = "drop-shipment"
 FIX_FUEL_SURCHARGE_COLUMN = "fix fuel surcharge"
+FIX_SECURITY_SURCHARGE_COLUMN = "fix security surcharge"
 SECURITY_SURCH_OUTLAY_COLUMN = "security surch outlay"
 FUEL_SURCHARGE_OUTLAY_COLUMN = "fuel surcharge outlay"
 FUEL_SURCHARGE_COST_NAME = "Fuel Surcharge"
 SECURITY_SURCHARGE_COST_NAME = "Security Surcharge"
 DGR_FEE_COLUMN = "DGR fee"
 DGR_FEE_HEADER = "DGR Fee"
+DGR_FEE_SHIPMENT_HEADER = 'DGR fee "yes" = as per outlay amount = fix'
 FLAT_TRANSPORT_COLUMN = "Flat"
 ORIGIN_COUNTRY_CODE_COLUMN = "origin country code"
 DESTINATION_COUNTRY_CODE_COLUMN = "destination country code"
@@ -117,6 +120,7 @@ EXCLUDED_SHIPMENT_COLUMNS = {
 
 RATIO_HANDLED_COST_COLUMNS = {
     FIX_FUEL_SURCHARGE_COLUMN,
+    FIX_SECURITY_SURCHARGE_COLUMN,
     SECURITY_SURCH_OUTLAY_COLUMN,
 }
 
@@ -318,6 +322,33 @@ def _build_shipment_columns(columns: pd.Index, rate_card: pd.DataFrame) -> list[
     return shipment_columns
 
 
+def _insert_dgr_fee_shipment_column(
+    shipment_columns: list[ShipmentColumn],
+    rate_card: pd.DataFrame,
+) -> list[ShipmentColumn]:
+    if DGR_FEE_COLUMN not in rate_card.columns:
+        return shipment_columns
+
+    updated = list(shipment_columns)
+    insert_at = next(
+        (
+            index
+            for index, column in enumerate(updated)
+            if _column_key(column.header) == _column_key("Airdeck")
+        ),
+        len(updated),
+    )
+    updated.insert(
+        insert_at,
+        ShipmentColumn(
+            header=DGR_FEE_SHIPMENT_HEADER,
+            source_column=DGR_FEE_COLUMN,
+            bold_header=False,
+        ),
+    )
+    return updated
+
+
 def _build_matrix_cost_column(
     cost_name: str,
     source_column: str,
@@ -494,7 +525,13 @@ def _build_fuel_and_security_blocks(
             )
         )
 
-    if SECURITY_SURCH_OUTLAY_COLUMN in rate_card.columns:
+    security_source_column = None
+    if FIX_SECURITY_SURCHARGE_COLUMN in rate_card.columns:
+        security_source_column = FIX_SECURITY_SURCHARGE_COLUMN
+    elif SECURITY_SURCH_OUTLAY_COLUMN in rate_card.columns:
+        security_source_column = SECURITY_SURCH_OUTLAY_COLUMN
+
+    if security_source_column is not None:
         blocks.append(
             MatrixCostBlock(
                 cost_name=f"{SECURITY_SURCHARGE_COST_NAME} {suffix}",
@@ -502,7 +539,7 @@ def _build_fuel_and_security_blocks(
                 columns=[
                     _build_matrix_cost_column(
                         f"{SECURITY_SURCHARGE_COST_NAME} {suffix}",
-                        SECURITY_SURCH_OUTLAY_COLUMN,
+                        security_source_column,
                         rate_unit="p/unit",
                     )
                 ],
@@ -1077,8 +1114,13 @@ def build_rate_card_matrix(
     *,
     drop_empty_or_zero_cost_columns: bool = False,
     ignore_volume_weight_ratio: bool = False,
+    include_dgr_fee_shipment_column: bool = False,
+    sheet_name: str = "Rate Card",
+    append_sheet_if_exists: bool = False,
 ) -> MatrixBuildResult:
     shipment_columns = _build_shipment_columns(rate_card.columns, rate_card)
+    if include_dgr_fee_shipment_column:
+        shipment_columns = _insert_dgr_fee_shipment_column(shipment_columns, rate_card)
     cost_blocks = _build_cost_blocks(
         rate_card.columns,
         rate_card,
@@ -1095,9 +1137,15 @@ def build_rate_card_matrix(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Rate Card"
+    if append_sheet_if_exists and output_path.exists():
+        workbook = load_workbook(output_path)
+        if sheet_name in workbook.sheetnames:
+            del workbook[sheet_name]
+        worksheet = workbook.create_sheet(title=sheet_name)
+    else:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = sheet_name
 
     for row_index, row_values in enumerate(matrix_rows, start=1):
         for column_index, value in enumerate(row_values, start=1):
@@ -1201,6 +1249,9 @@ def build_matrix_from_rate_card(
     latam_only: bool = False,
     drop_empty_or_zero_cost_columns: bool = False,
     ignore_volume_weight_ratio: bool = False,
+    include_dgr_fee_shipment_column: bool = False,
+    sheet_name: str = "Rate Card",
+    append_sheet_if_exists: bool = False,
 ) -> MatrixBuildResult:
     original_row_count = len(rate_card)
     filtered_rate_card = apply_lane_country_filters(
@@ -1224,6 +1275,9 @@ def build_matrix_from_rate_card(
         output_file,
         drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
         ignore_volume_weight_ratio=ignore_volume_weight_ratio,
+        include_dgr_fee_shipment_column=include_dgr_fee_shipment_column,
+        sheet_name=sheet_name,
+        append_sheet_if_exists=append_sheet_if_exists,
     )
     if de_only or latam_only:
         print(f"Filtered lanes: {original_row_count} -> {len(filtered_rate_card)} rows")
@@ -1247,6 +1301,7 @@ def build_matrix_from_processing_file(
     latam_only: bool = False,
     drop_empty_or_zero_cost_columns: bool = False,
     ignore_volume_weight_ratio: bool = False,
+    include_dgr_fee_shipment_column: bool = False,
 ) -> MatrixBuildResult:
     rate_card = load_extracted_rate_card(processing_file)
     original_row_count = len(rate_card)
@@ -1272,6 +1327,7 @@ def build_matrix_from_processing_file(
         output_file,
         drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
         ignore_volume_weight_ratio=ignore_volume_weight_ratio,
+        include_dgr_fee_shipment_column=include_dgr_fee_shipment_column,
     )
     if de_only or latam_only:
         print(f"Filtered lanes: {original_row_count} -> {len(rate_card)} rows")
