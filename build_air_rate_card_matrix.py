@@ -294,7 +294,8 @@ def _format_shipment_cell_value(header: str, value: object) -> object:
 def _build_shipment_columns(columns: pd.Index, rate_card: pd.DataFrame) -> list[ShipmentColumn]:
     shipment_columns: list[ShipmentColumn] = []
     for column in columns:
-        name = _normalize_label(column)
+        source_name = str(column).strip()
+        name = _normalize_label(source_name)
         if _column_key(name) in {_column_key(item) for item in EXCLUDED_SHIPMENT_COLUMNS}:
             continue
         if is_cost_column(name):
@@ -305,7 +306,7 @@ def _build_shipment_columns(columns: pd.Index, rate_card: pd.DataFrame) -> list[
         shipment_columns.append(
             ShipmentColumn(
                 header=name,
-                source_column=name,
+                source_column=source_name,
                 bold_header=name in BOLD_SHIPMENT_HEADERS,
             )
         )
