@@ -53,6 +53,7 @@ RATE_CARD_COLUMN_RENAMES = {
     "2000 01 01 00 00 00": "ValidFrom",
     "2000 12 31 00 00 00": "ValidUntil",
     "1999 12 12 00 00 00": "date of update",
+    "published nominated": "published P PC LO int",
 }
 
 # Hardcoded mapping for dual-header templates:
@@ -114,6 +115,48 @@ RATE_CARD_UPPER_TO_LOWER_HEADER_RENAMES = {
     "additional information s": "additional_information",
     "service code extended": "service_code_extended",
 }
+
+
+def _is_technical_header_token(value: str) -> bool:
+    token = value.strip()
+    if not token:
+        return False
+    if token in RATE_CARD_UPPER_TO_LOWER_HEADER_RENAMES.values():
+        return True
+    return bool(re.fullmatch(r"[A-Za-z]+(?:_[A-Za-z0-9]+)+", token))
+
+
+def _looks_like_duplicate_technical_header_row(row: pd.Series) -> bool:
+    non_empty_values = [
+        str(value).strip()
+        for value in row
+        if not pd.isna(value) and str(value).strip()
+    ]
+    if len(non_empty_values) < 5:
+        return False
+    technical_hits = sum(1 for value in non_empty_values if _is_technical_header_token(value))
+    return technical_hits >= 5 and technical_hits / len(non_empty_values) >= 0.5
+
+
+def _should_drop_first_extracted_row(rate_card: pd.DataFrame) -> bool:
+    if rate_card.empty:
+        return False
+    row = rate_card.iloc[0]
+    non_empty_values = [
+        str(value).strip()
+        for value in row
+        if not pd.isna(value) and str(value).strip()
+    ]
+    if len(non_empty_values) < 2:
+        return False
+
+    # Drop only when the first extracted row is clearly the technical header row
+    # (snake_case tokens such as country_contract_owner, DGR_fee, ...).
+    technical_tokens = sum(1 for value in non_empty_values if _is_technical_header_token(value))
+    snake_case_tokens = sum(
+        1 for value in non_empty_values if bool(re.fullmatch(r"[A-Za-z]+(?:_[A-Za-z0-9]+)+", value))
+    )
+    return technical_tokens >= 5 and snake_case_tokens >= 3
 
 
 @dataclass
@@ -279,6 +322,10 @@ def extract_rate_card_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     rate_card = df_raw.iloc[header_row + 1 :].copy()
     rate_card.columns = rename_rate_card_columns(column_names)
     rate_card = rate_card.dropna(how="all").reset_index(drop=True)
+    if len(rate_card) >= 1 and "country contract owner" in rate_card.columns:
+        first_value = str(rate_card.loc[0, "country contract owner"]).strip().lower()
+        if first_value == "country_contract_owner":
+            rate_card = rate_card.iloc[1:].reset_index(drop=True)
     return rate_card, header_row
 
 
