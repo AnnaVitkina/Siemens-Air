@@ -687,7 +687,7 @@ def _build_standalone_cost_blocks(
         if _is_ratio_handled_column(name):
             continue
         if _is_dgr_fee_column(name):
-            blocks.append(_build_dgr_fee_cost_block())
+            blocks.append(_build_dgr_fee_cost_block(rate_card))
             continue
         if _is_flat_ipc_column(name):
             blocks.append(_build_flat_ipc_cost_block())
@@ -820,40 +820,56 @@ def _is_dgr_fee_block(block: MatrixCostBlock) -> bool:
     return block.cost_name == DGR_FEE_HEADER
 
 
-def _build_dgr_fee_cost_block() -> MatrixCostBlock:
+def _build_dgr_fee_cost_block(rate_card: pd.DataFrame) -> MatrixCostBlock:
+    include_secondary = False
+    if DGR_FEE_COLUMN in rate_card.columns:
+        include_secondary = rate_card[DGR_FEE_COLUMN].apply(
+            lambda value: not _is_empty_value(_parse_dgr_fee_secondary(value))
+        ).any()
+
+    columns = [
+        MatrixCostColumn(
+            cost_name=DGR_FEE_HEADER,
+            source_column="Currency",
+            bracket_label="Currency",
+            rate_unit="Currency",
+            is_currency=True,
+            header_label="dgr_primary_currency",
+        ),
+        MatrixCostColumn(
+            cost_name=DGR_FEE_HEADER,
+            source_column=DGR_FEE_COLUMN,
+            bracket_label="",
+            rate_unit="Flat",
+            parse_value=_parse_dgr_fee_primary,
+        ),
+    ]
+
+    if include_secondary:
+        columns.extend(
+            [
+                MatrixCostColumn(
+                    cost_name=DGR_FEE_HEADER,
+                    source_column="Currency",
+                    bracket_label="Currency",
+                    rate_unit="Currency",
+                    is_currency=True,
+                    header_label="dgr_secondary_currency",
+                ),
+                MatrixCostColumn(
+                    cost_name=DGR_FEE_HEADER,
+                    source_column=DGR_FEE_COLUMN,
+                    bracket_label="",
+                    rate_unit="p/unit",
+                    parse_value=_parse_dgr_fee_secondary,
+                ),
+            ]
+        )
+
     return MatrixCostBlock(
         cost_name=DGR_FEE_HEADER,
         currency_column="Currency",
-        columns=[
-            MatrixCostColumn(
-                cost_name=DGR_FEE_HEADER,
-                source_column="Currency",
-                bracket_label="Currency",
-                rate_unit="Currency",
-                is_currency=True,
-            ),
-            MatrixCostColumn(
-                cost_name=DGR_FEE_HEADER,
-                source_column=DGR_FEE_COLUMN,
-                bracket_label="",
-                rate_unit="Flat",
-                parse_value=_parse_dgr_fee_primary,
-            ),
-            MatrixCostColumn(
-                cost_name=DGR_FEE_HEADER,
-                source_column="Currency",
-                bracket_label="Currency",
-                rate_unit="Currency",
-                is_currency=True,
-            ),
-            MatrixCostColumn(
-                cost_name=DGR_FEE_HEADER,
-                source_column=DGR_FEE_COLUMN,
-                bracket_label="",
-                rate_unit="p/unit",
-                parse_value=_parse_dgr_fee_secondary,
-            ),
-        ],
+        columns=columns,
     )
 
 
@@ -934,7 +950,8 @@ def _cost_block_has_data(block: MatrixCostBlock, rate_card: pd.DataFrame) -> boo
 
     for _, row in rate_card.iterrows():
         for column in block.columns:
-            if not _is_empty_value(row[column.source_column]):
+            value = _value_for_block(row, block, column)
+            if not _is_empty_value(value):
                 return True
     return False
 
@@ -1017,6 +1034,35 @@ def _value_for_block(
         return None
 
     value = row[column.source_column]
+    if column.is_currency:
+        if _is_dgr_fee_block(block):
+            dgr_raw = row.get(DGR_FEE_COLUMN, None)
+            if column.header_label == "dgr_secondary_currency":
+                if _is_empty_value(_parse_dgr_fee_secondary(dgr_raw)):
+                    return None
+            else:
+                if _is_empty_value(_parse_dgr_fee_primary(dgr_raw)):
+                    return None
+        else:
+            # For all other costs, show currency only when at least one rate value
+            # in the same cost block is present for this row.
+            has_rate_value = False
+            for rate_column in block.columns:
+                if rate_column.is_currency:
+                    continue
+                if rate_column.source_column not in row.index:
+                    continue
+                rate_value = row[rate_column.source_column]
+                if _is_transport_cost_block(block):
+                    rate_value = _resolve_transport_column_value(row, rate_column.source_column)
+                elif rate_column.parse_value is not None:
+                    rate_value = rate_column.parse_value(rate_value)
+                if not _is_empty_value(_sanitize_cost_value(rate_value)):
+                    has_rate_value = True
+                    break
+            if not has_rate_value:
+                return None
+
     if _is_transport_cost_block(block):
         value = _resolve_transport_column_value(row, column.source_column)
     elif column.parse_value is not None:
