@@ -45,6 +45,7 @@ RATE_CARD_COLUMN_RENAMES = {
     "siemens_business": "siemens division",
     "siemens_buisness": "siemens division",
     "airline surcharge per kg": "fix fuel surcharge",
+    "saf adder per kg gross weight": "fix security surcharge",
     "applicable for": "appli for DGR or Special",
     "volume weight ratio": "volume weight ratio",
     "volume weight ratio e g 0 0 0 1 6 6 1 7 7 1 8 8": "volume weight ratio",
