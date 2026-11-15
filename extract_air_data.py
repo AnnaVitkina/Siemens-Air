@@ -20,6 +20,11 @@ DEFAULT_SHEETS = {
     "zones": "Airport zones GAT",
 }
 
+INNOMOTICS_DEFAULT_SHEETS = {
+    "rate_card": "Rate Card",
+    "zones": "Airport Zone List",
+}
+
 OUTPUT_SHEET_NAMES = {
     "rate_card": "Rate Card",
     "zones": "Zones",
@@ -55,6 +60,17 @@ RATE_CARD_COLUMN_RENAMES = {
     "2000 12 31 00 00 00": "ValidUntil",
     "1999 12 12 00 00 00": "date of update",
     "published nominated": "published P PC LO int",
+    # Innomotics template aliases
+    "forwarder": "forwarder name",
+    "valid from": "ValidFrom",
+    "valid until": "ValidUntil",
+    "fixed fsc per kg same currency as the a t a rate updated quarterly": "fix fuel surcharge",
+    "geopolitical surcharge per kg same currency as a t a rate only if applicable": (
+        "geopolitical surcharge"
+    ),
+    "rate applicable for main deck dims details adjacent main deck is accepted only if the hight of the package is above 1 6m": (
+        "Airdeck"
+    ),
 }
 
 # Hardcoded mapping for dual-header templates:
@@ -331,13 +347,13 @@ def extract_rate_card_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, int]:
 
 
 def find_zones_header_row(df_raw: pd.DataFrame) -> int:
-    for row_index in range(min(10, len(df_raw))):
-        first_cell = df_raw.iloc[row_index, 0]
-        if pd.isna(first_cell):
-            continue
-        text = str(first_cell).strip().lower()
-        if "airport" in text and "code" in text:
-            return row_index
+    for row_index in range(min(15, len(df_raw))):
+        for value in df_raw.iloc[row_index]:
+            if pd.isna(value):
+                continue
+            text = str(value).strip().lower()
+            if "airport" in text and "code" in text:
+                return row_index
     return 0
 
 

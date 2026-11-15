@@ -61,6 +61,7 @@ from export_postal_code_zones import (  # noqa: E402
 )
 from extract_air_data import (  # noqa: E402
     DEFAULT_SHEETS,
+    INNOMOTICS_DEFAULT_SHEETS,
     ExtractionResult,
     extract_air_workbook,
     extract_air_workbook_rate_card_only,
@@ -79,14 +80,16 @@ class PipelineResult:
     zones: ZonesExportResult | None
 
 
-def prompt_shipper_mode() -> Literal["standard", "latam"]:
+def prompt_shipper_mode() -> Literal["standard", "latam", "innomotics"]:
     choice = prompt_choice(
         "Which shipper is this file for?",
-        ["Siemens Healthineers/Divisions", "Siemens LATAM"],
+        ["Siemens Healthineers/Divisions", "Siemens LATAM", "Innomotics"],
         default="Siemens Healthineers/Divisions",
     )
     if choice == "Siemens LATAM":
         return "latam"
+    if choice == "Innomotics":
+        return "innomotics"
     return "standard"
 
 
@@ -107,12 +110,12 @@ def prompt_siemens_business_scope() -> Literal["all_di", "all_di_shs", "both"]:
     return "all_di"
 
 
-def prompt_use_zones_for_standard_shipper() -> bool:
-    return prompt_choice(
-        "Use Zones tab for Siemens Healthineers/Divisions processing?",
-        ["Yes", "No"],
-        default="Yes",
-    ) == "Yes"
+def prompt_use_zones_for_shipper(shipper_mode: Literal["standard", "innomotics"]) -> bool:
+    if shipper_mode == "innomotics":
+        label = "Use Zones tab for Innomotics processing?"
+    else:
+        label = "Use Zones tab for Siemens Healthineers/Divisions processing?"
+    return prompt_choice(label, ["Yes", "No"], default="Yes") == "Yes"
 
 
 def filter_rate_card_by_siemens_business(
@@ -169,10 +172,26 @@ def filter_rate_card_by_siemens_business(
     return rate_card[keep_mask].reset_index(drop=True)
 
 
-def get_default_rate_card_sheet(file_path: Path, shipper_mode: Literal["standard", "latam"]) -> str:
+def get_default_rate_card_sheet(
+    file_path: Path,
+    shipper_mode: Literal["standard", "latam", "innomotics"],
+) -> str:
     if shipper_mode == "latam":
         return LATAM_RATE_CARD_DEFAULT_SHEET
+    if shipper_mode == "innomotics":
+        return INNOMOTICS_DEFAULT_SHEETS["rate_card"]
     return DEFAULT_SHEETS["rate_card"]
+
+
+def get_default_zones_sheet(shipper_mode: Literal["standard", "innomotics"]) -> str:
+    if shipper_mode == "innomotics":
+        return INNOMOTICS_DEFAULT_SHEETS["zones"]
+    return DEFAULT_SHEETS["zones"]
+
+
+def uses_standard_global_logic(shipper_mode: Literal["standard", "latam", "innomotics"]) -> bool:
+    """Healthineers/Divisions and Innomotics share the same zones+matrix flow."""
+    return shipper_mode in {"standard", "innomotics"}
 
 
 def run_interactive_pipeline() -> PipelineResult:
@@ -213,29 +232,40 @@ def run_interactive_pipeline() -> PipelineResult:
             default_rate_card_sheet,
         )
     else:
-        use_zones = prompt_use_zones_for_standard_shipper()
+        use_zones = prompt_use_zones_for_shipper(shipper_mode)
+        rate_card_prompt = (
+            "Rate Card (look for tab containing: Rate Card)"
+            if shipper_mode == "innomotics"
+            else "Rate Card (look for tab containing: air rate card)"
+        )
+        zones_default = get_default_zones_sheet(shipper_mode)
+        zones_prompt = (
+            "Zones (look for tab containing: Airport Zone List)"
+            if shipper_mode == "innomotics"
+            else "Zones (look for tab containing: Airport zones GAT)"
+        )
         if use_zones:
             sheet_mapping = {
                 "rate_card": prompt_sheet_name(
                     sheet_names,
-                    "Rate Card (look for tab containing: air rate card)",
+                    rate_card_prompt,
                     default_rate_card_sheet,
                 ),
                 "zones": prompt_sheet_name(
                     sheet_names,
-                    "Zones (look for tab containing: Airport zones GAT)",
-                    DEFAULT_SHEETS["zones"],
+                    zones_prompt,
+                    zones_default,
                 ),
             }
         else:
             rate_card_tab = prompt_sheet_name(
                 sheet_names,
-                "Rate Card (look for tab containing: air rate card)",
+                rate_card_prompt,
                 default_rate_card_sheet,
             )
 
     print("\n--- Step 1/3: Extracting source workbook ---")
-    if shipper_mode == "latam" or (shipper_mode == "standard" and not use_zones):
+    if shipper_mode == "latam" or (uses_standard_global_logic(shipper_mode) and not use_zones):
         extraction = extract_air_workbook_rate_card_only(file_path, rate_card_tab)
     else:
         extraction = extract_air_workbook(file_path, sheet_mapping)
@@ -248,6 +278,8 @@ def run_interactive_pipeline() -> PipelineResult:
     else:
         print(f"  Zones rows: {len(extraction.zones)}")
 
+    # Siemens_Business filtering applies only to Healthineers/Divisions.
+    # Innomotics rate cards do not have that column.
     business_scope: Literal["all_di", "all_di_shs", "both"] = "all_di"
     if shipper_mode == "standard":
         business_scope = prompt_siemens_business_scope()
@@ -292,7 +324,7 @@ def run_interactive_pipeline() -> PipelineResult:
         print("\n--- Step 2/3: Skipping zones export (LATAM mode) ---")
     elif not use_zones:
         print("\n--- Step 2/3: Skipping zones export (Zones ignored by choice) ---")
-        if business_scope == "both":
+        if shipper_mode == "standard" and business_scope == "both":
             rate_card_all_di = filter_rate_card_by_siemens_business(rate_card, {"ALL", "DI", ""})
             rate_card_all_di_shs = filter_rate_card_by_siemens_business(
                 rate_card, {"ALL", "DI", "SHS", ""}
@@ -301,7 +333,7 @@ def run_interactive_pipeline() -> PipelineResult:
                 print("  Scope ALL_DI has no lanes after filtering (tab will be skipped).")
             if len(rate_card_all_di_shs) == 0:
                 print("  Scope ALL_DI_SHS has no lanes after filtering (tab will be skipped).")
-    elif business_scope == "both":
+    elif shipper_mode == "standard" and business_scope == "both":
         print(
             "\n--- Step 2/3: Applying exclusions per Siemens_Business scope "
             "(independent for each tab) ---"
@@ -418,7 +450,7 @@ def run_interactive_pipeline() -> PipelineResult:
             latam_only=False,
             drop_empty_or_zero_cost_columns=drop_empty_or_zero_cost_columns,
             ignore_volume_weight_ratio=(shipper_mode == "latam"),
-            include_dgr_fee_shipment_column=(shipper_mode == "standard"),
+            include_dgr_fee_shipment_column=uses_standard_global_logic(shipper_mode),
         )
         print(f"Saved matrix workbook: {matrix.matrix_path}")
         print(f"  Data rows: {matrix.row_count}")
@@ -441,7 +473,7 @@ def run_interactive_pipeline() -> PipelineResult:
             print("Zones file:         skipped (no lanes in both scopes)")
     elif zones is not None:
         print(f"Zones file:         {zones.output_path}")
-    elif shipper_mode == "standard" and not use_zones:
+    elif uses_standard_global_logic(shipper_mode) and not use_zones:
         print("Zones file:         skipped (ignored by choice)")
     else:
         print("Zones file:         skipped (LATAM mode)")

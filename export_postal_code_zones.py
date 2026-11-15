@@ -17,6 +17,7 @@ from project_paths import OUTPUT_DIR, PROCESSING_DIR
 ORIGIN_ZONE_COLUMN = "Origin Zone"
 DESTINATION_ZONE_COLUMN = "Destination Zone"
 SERVICE_CODE_COLUMN = "service code extended"
+SERVICE_CODE_FALLBACK_COLUMNS = ("service code extended", "service code")
 ZONES_AIRPORT_COLUMN = "Airport code (5-digit)"
 ZONES_REGION_COLUMN = "Zone GAT2020"
 
@@ -65,6 +66,16 @@ def _normalize_service_code(value: object) -> str:
     if text.endswith(".0"):
         text = text[:-2]
     return text
+
+
+def _resolve_service_code_column(rate_card: pd.DataFrame) -> str:
+    for column_name in SERVICE_CODE_FALLBACK_COLUMNS:
+        if column_name in rate_card.columns:
+            return column_name
+    raise ValueError(
+        "Missing service code column. "
+        f"Tried: {', '.join(SERVICE_CODE_FALLBACK_COLUMNS)}"
+    )
 
 
 def _build_exclusion_zone_name(all_zone: str, airport_zone: str) -> str:
@@ -191,16 +202,17 @@ def _find_origin_side_conflicts(
     all_zone: str,
     airport_zone: str,
     region_postal_lookup: dict[str, frozenset[str]],
+    service_code_column: str,
 ) -> set[tuple[str, str]]:
     conflicts: set[tuple[str, str]] = set()
     service_codes = {
         _normalize_service_code(value)
-        for value in rate_card[SERVICE_CODE_COLUMN].dropna()
+        for value in rate_card[service_code_column].dropna()
     }
 
     for service_code in service_codes:
         service_mask = (
-            rate_card[SERVICE_CODE_COLUMN].map(_normalize_service_code) == service_code
+            rate_card[service_code_column].map(_normalize_service_code) == service_code
         )
         group = rate_card.loc[service_mask]
 
@@ -235,16 +247,17 @@ def _find_destination_side_conflicts(
     all_zone: str,
     airport_zone: str,
     region_postal_lookup: dict[str, frozenset[str]],
+    service_code_column: str,
 ) -> set[tuple[str, str]]:
     conflicts: set[tuple[str, str]] = set()
     service_codes = {
         _normalize_service_code(value)
-        for value in rate_card[SERVICE_CODE_COLUMN].dropna()
+        for value in rate_card[service_code_column].dropna()
     }
 
     for service_code in service_codes:
         service_mask = (
-            rate_card[SERVICE_CODE_COLUMN].map(_normalize_service_code) == service_code
+            rate_card[service_code_column].map(_normalize_service_code) == service_code
         )
         group = rate_card.loc[service_mask]
 
@@ -277,6 +290,10 @@ def apply_all_country_zone_exclusions(
     region_postal_lookup = _build_region_postal_lookup(zones_df)
     exclusions = detect_all_country_exclusions(updated, zone_names, zones_df)
     replacement_count = 0
+    if not exclusions:
+        return updated, exclusions, replacement_count
+
+    service_code_column = _resolve_service_code_column(updated)
 
     for exclusion in exclusions:
         origin_conflicts = _find_origin_side_conflicts(
@@ -284,6 +301,7 @@ def apply_all_country_zone_exclusions(
             exclusion.all_zone,
             exclusion.airport_zone,
             region_postal_lookup,
+            service_code_column,
         )
         for destination_zone, service_code in origin_conflicts:
             mask = (
@@ -292,7 +310,7 @@ def apply_all_country_zone_exclusions(
                 updated[DESTINATION_ZONE_COLUMN].map(_normalize_zone_name)
                 == destination_zone
             ) & (
-                updated[SERVICE_CODE_COLUMN].map(_normalize_service_code) == service_code
+                updated[service_code_column].map(_normalize_service_code) == service_code
             )
             replacement_count += int(mask.sum())
             updated.loc[mask, ORIGIN_ZONE_COLUMN] = exclusion.exclusion_name
@@ -302,6 +320,7 @@ def apply_all_country_zone_exclusions(
             exclusion.all_zone,
             exclusion.airport_zone,
             region_postal_lookup,
+            service_code_column,
         )
         for origin_zone, service_code in destination_conflicts:
             mask = (
@@ -310,7 +329,7 @@ def apply_all_country_zone_exclusions(
             ) & (
                 updated[ORIGIN_ZONE_COLUMN].map(_normalize_zone_name) == origin_zone
             ) & (
-                updated[SERVICE_CODE_COLUMN].map(_normalize_service_code) == service_code
+                updated[service_code_column].map(_normalize_service_code) == service_code
             )
             replacement_count += int(mask.sum())
             updated.loc[mask, DESTINATION_ZONE_COLUMN] = exclusion.exclusion_name
