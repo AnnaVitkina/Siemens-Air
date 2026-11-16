@@ -61,7 +61,7 @@ RATE_CARD_COLUMN_RENAMES = {
     "1999 12 12 00 00 00": "date of update",
     "published nominated": "published P PC LO int",
     # Innomotics template aliases
-    "forwarder": "forwarder name",
+    # Keep "Forwarder" as-is (do not map to "forwarder name", which is matrix-excluded).
     "valid from": "ValidFrom",
     "valid until": "ValidUntil",
     "fixed fsc per kg same currency as the a t a rate updated quarterly": "fix fuel surcharge",
@@ -339,6 +339,8 @@ def extract_rate_card_df(df_raw: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     rate_card = df_raw.iloc[header_row + 1 :].copy()
     rate_card.columns = rename_rate_card_columns(column_names)
     rate_card = rate_card.dropna(how="all").reset_index(drop=True)
+    # Drop blank leading/trailing Excel columns (e.g. Innomotics empty col 0 -> "Column 1").
+    rate_card = rate_card.loc[:, rate_card.notna().any()].copy()
     if len(rate_card) >= 1 and "country contract owner" in rate_card.columns:
         first_value = str(rate_card.loc[0, "country contract owner"]).strip().lower()
         if first_value == "country_contract_owner":
