@@ -156,6 +156,10 @@ def detect_all_country_exclusions(
         for zone_name in zone_names
         if ALL_COUNTRY_ZONE_PATTERN.match(zone_name)
     ]
+    if not all_country_zones:
+        return exclusions
+
+    service_code_column = _resolve_service_code_column(rate_card)
 
     for all_zone in all_country_zones:
         country_match = ALL_COUNTRY_ZONE_PATTERN.match(all_zone)
@@ -169,12 +173,14 @@ def detect_all_country_exclusions(
                 all_zone,
                 airport_zone,
                 region_postal_lookup,
+                service_code_column,
             )
             destination_conflicts = _find_destination_side_conflicts(
                 rate_card,
                 all_zone,
                 airport_zone,
                 region_postal_lookup,
+                service_code_column,
             )
             if not origin_conflicts and not destination_conflicts:
                 continue
